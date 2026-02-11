@@ -1,168 +1,146 @@
-/************************************************************
- * ESP32 PV-Überschussregelung
- * + Telemetrie zu InfluxDB & Home Assistant (alle 10 s)
- ************************************************************/
-
-#include <Ethernet.h>
-#include <ArduinoModbus.h>
+#include <WiFi.h>
+#include <WiFiUdp.h>
+#include <ArduinoJson.h>
+#include <ModbusTCPClient.h>
 #include <HTTPClient.h>
 
-/**************** Netzwerk ****************/
+/* =========================================================
+   WLAN
+   ========================================================= */
+const char* WIFI_SSID = "DEIN_WLAN";
+const char* WIFI_PASS = "PASSWORT";
 
-byte mac[] = { 0xDE, 0xAD, 0xBE, 0xEF, 0x32, 0x01 };
-IPAddress ip(192,168,1,50);
+/* =========================================================
+   myPV SmartMeter (ModbusTCP)
+   → SmartMeter = SERVER
+   → ESP32      = CLIENT
+   ========================================================= */
+IPAddress SMARTMETER_IP(192,168,1,50);
+const uint16_t SMARTMETER_PORT = 502;
+ModbusTCPClient modbus;
 
-IPAddress smartMeterIP(192,168,1,20);
-IPAddress venusIP(192,168,1,30);
+/* =========================================================
+   Marstek Venus E (UDP Open API)
+   ========================================================= */
+IPAddress MARSTEK_IP(192,168,1,60);
+const uint16_t MARSTEK_PORT = 30000;
+WiFiUDP udp;
 
-/**************** InfluxDB ****************/
+/* =========================================================
+   InfluxDB / Home Assistant
+   ========================================================= */
+const char* INFLUX_URL = "http://192.168.1.10:8086/write?db=pv";
+const char* HA_URL     = "http://192.168.1.10:8123/api/states/sensor.pv";
 
-const char* INFLUX_URL = "http://192.168.1.100:8086/api/v2/write?org=home&bucket=energy&precision=s";
-const char* INFLUX_TOKEN = "INFLUX_TOKEN";
+/* =========================================================
+   Timing
+   ========================================================= */
+unsigned long lastControlMs = 0;
+unsigned long lastLogMs     = 0;
 
-/**************** Home Assistant ****************/
+/* =========================================================
+   Regelparameter
+   ========================================================= */
+#define GRID_TARGET_W     0
+#define MAX_CHARGE_W   4000
+#define MAX_DISCHARGE_W 4000
 
-const char* HA_URL = "http://192.168.1.10:8123/api/states/sensor.esp32_pv_controller";
-const char* HA_TOKEN = "HA_LONG_LIVED_TOKEN";
+/* =========================================================
+   Modbus Register (myPV Dokumentation!)
+   ========================================================= */
+#define REG_GRID_POWER 30001  // Netzleistung (+ Bezug / − Einspeisung)
 
-/**************** Regelparameter ****************/
+/* =========================================================
+   Hilfsfunktionen
+   ========================================================= */
 
-const int LOOP_TIME_MS = 100;
-const int LOG_INTERVAL_MS = 10000;
+/* -------- Netzleistung lesen (kritisch!) -------- */
+int readGridPower() {
+  if (!modbus.connected()) {
+    modbus.begin(SMARTMETER_IP, SMARTMETER_PORT);
+  }
 
-const int DEADZONE_W = 80;
-const int MAX_CHARGE_W = 2500;
-const int MAX_DISCHARGE_W = 2500;
-const int RAMP_W = 300;
+  uint16_t raw;
+  if (!modbus.holdingRegisterRead(1, REG_GRID_POWER, raw)) {
+    // FEHLER → wir regeln trotzdem weiter mit letztem Wert
+    return 0;
+  }
 
-/**************** Laufzeit ****************/
-
-int currentPowerSetpoint = 0;
-int lastGridPower = 0;
-
-unsigned long lastLogTime = 0;
-
-/**************** Setup ****************/
-
-void setup() {
-  Ethernet.begin(mac, ip);
-  delay(1000);
-
-  ModbusTCPClient.begin(smartMeterIP);
-
-  Serial.begin(115200);
-  Serial.println("ESP32 Speicherregelung + Telemetrie gestartet");
+  // myPV liefert signed 16 bit
+  return (int16_t)raw;
 }
 
-/**************** Loop ****************/
+/* -------- Marstek Leistung setzen -------- */
+void setMarstekPower(int powerW) {
 
-void loop() {
+  // Begrenzen – Sicherheit!
+  powerW = constrain(powerW, -MAX_CHARGE_W, MAX_DISCHARGE_W);
 
-  if (!ModbusTCPClient.connected()) {
-    ModbusTCPClient.begin(smartMeterIP);
-    delay(50);
-  }
+  StaticJsonDocument<256> doc;
+  doc["id"] = 1;
+  doc["method"] = "ES.SetMode";
 
-  /******** Netzleistung lesen ********/
+  JsonObject params = doc.createNestedObject("params");
+  params["id"] = 0;
 
-  ModbusTCPClient.requestFrom(
-    1,
-    HOLDING_REGISTERS,
-    30001,
-    1
-  );
+  JsonObject cfg = params.createNestedObject("config");
+  cfg["mode"] = "Passive";
 
-  int gridPower = ModbusTCPClient.read();
-  lastGridPower = gridPower;
+  JsonObject passive = cfg.createNestedObject("passive_cfg");
+  passive["power"]   = powerW;
+  passive["cd_time"] = 15;   // wichtig: Watchdog im Speicher
 
-  /******** Zielwert berechnen ********/
+  char buffer[256];
+  serializeJson(doc, buffer);
 
-  int targetPower = 0;
-
-  if (gridPower < -DEADZONE_W) {
-    targetPower = constrain(-gridPower, 0, MAX_CHARGE_W);
-  }
-  else if (gridPower > DEADZONE_W) {
-    targetPower = -constrain(gridPower, 0, MAX_DISCHARGE_W);
-  }
-
-  /******** Rampe ********/
-
-  if (targetPower > currentPowerSetpoint + RAMP_W)
-    currentPowerSetpoint += RAMP_W;
-  else if (targetPower < currentPowerSetpoint - RAMP_W)
-    currentPowerSetpoint -= RAMP_W;
-  else
-    currentPowerSetpoint = targetPower;
-
-  /******** Speicher steuern ********/
-
-  sendPowerToVenus(currentPowerSetpoint);
-
-  /******** Telemetrie alle 10 s ********/
-
-  if (millis() - lastLogTime > LOG_INTERVAL_MS) {
-    lastLogTime = millis();
-    sendToInflux(lastGridPower, currentPowerSetpoint);
-    sendToHomeAssistant(lastGridPower, currentPowerSetpoint);
-  }
-
-  delay(LOOP_TIME_MS);
+  udp.beginPacket(MARSTEK_IP, MARSTEK_PORT);
+  udp.write((uint8_t*)buffer, strlen(buffer));
+  udp.endPacket();
 }
 
-/**************** Venus-E ****************/
-
-void sendPowerToVenus(int powerW) {
-
-  HTTPClient http;
-  String url = "http://" + venusIP.toString() + "/api/setPower";
-
-  http.begin(url);
-  http.addHeader("Content-Type", "application/json");
-
-  String payload = "{ \"power\": " + String(powerW) + " }";
-  http.POST(payload);
-  http.end();
-}
-
-/**************** InfluxDB ****************/
-
-void sendToInflux(int gridW, int storageW) {
-
+/* -------- Logging (unkritisch!) -------- */
+void logData(int gridPower) {
   HTTPClient http;
   http.begin(INFLUX_URL);
-  http.addHeader("Authorization", String("Token ") + INFLUX_TOKEN);
-  http.addHeader("Content-Type", "text/plain");
-
-  // Line Protocol
-  String line =
-    "pv_controller,device=esp32 "
-    "grid_power=" + String(gridW) + "," +
-    "storage_power=" + String(storageW);
-
-  http.POST(line);
+  http.POST("grid_power value=" + String(gridPower));
   http.end();
 }
 
-/**************** Home Assistant ****************/
+/* =========================================================
+   SETUP
+   ========================================================= */
+void setup() {
+  Serial.begin(115200);
 
-void sendToHomeAssistant(int gridW, int storageW) {
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  while (WiFi.status() != WL_CONNECTED) delay(500);
 
-  HTTPClient http;
-  http.begin(HA_URL);
-  http.addHeader("Authorization", String("Bearer ") + HA_TOKEN);
-  http.addHeader("Content-Type", "application/json");
+  udp.begin(40000); // lokaler UDP-Port
+}
 
-  String payload =
-    "{"
-    "\"state\": \"" + String(gridW) + "\","
-    "\"attributes\": {"
-      "\"storage_power\": " + String(storageW) + ","
-      "\"unit_of_measurement\": \"W\","
-      "\"friendly_name\": \"ESP32 PV Controller\""
-    "}"
-    "}";
+/* =========================================================
+   LOOP
+   ========================================================= */
+void loop() {
+  unsigned long now = millis();
 
-  http.PUT(payload);
-  http.end();
+  /* ================== REGELUNG (1 s) ================== */
+  if (now - lastControlMs >= 1000) {
+    lastControlMs = now;
+
+    int gridPower = readGridPower();
+
+    // Ziel: Netzleistung = 0 W
+    int batteryPower = -gridPower;
+
+    setMarstekPower(batteryPower);
+  }
+
+  /* ================== LOGGING (10 s) ================== */
+  if (now - lastLogMs >= 10000) {
+    lastLogMs = now;
+
+    int gridPower = readGridPower();
+    logData(gridPower);
+  }
 }
