@@ -1,7 +1,7 @@
 name: Unit Tests
 
 on:
-  # the 1st condition
+  push: 
   workflow_run:                             # triggers when "build" runs and completes  
     workflows: ["CI-CD"]
     types:
